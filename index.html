@@ -330,7 +330,7 @@ const TABS = [
 // Súbelo cada vez que se entregue una versión nueva del archivo, así en la
 // barra lateral se puede comprobar de un vistazo si el archivo abierto es
 // la última versión o una copia vieja.
-const APP_VERSION = "v6.9 · 2026-09-04";
+const APP_VERSION = "v7.1 · 2026-09-04";
 
 const SUPABASE_URL = "https://awlgrjrotrzlzquvojkv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_qP20SCcrz30OKe6JMHhcKg_4LhoqcCm";
@@ -3605,25 +3605,42 @@ function SaveMenu({ onSelect }) {
   // limitarse a abortar en el primer fallo.
   const importInto = async (newSaveId, data, onProgress) => {
     const CHUNK_SIZE = 8;
-    const TABLES = [
+    const allReleases = data.releases || [];
+    const albums = allReleases.filter((r) => !r.parentReleaseId);
+    const singles = allReleases.filter((r) => r.parentReleaseId);
+    // las portadas (imágenes incrustadas) son, con diferencia, lo más
+    // pesado de cada fila — se guardan aparte, en una fase final propia,
+    // para que el resto de los datos (lo importante) no dependa de que esa
+    // parte tan pesada funcione a la primera
+    const releaseWithoutCover = (toRow) => (r) => { const row = toRow(r); delete row.cover_url; return row; };
+    const releasesWithCover = allReleases.filter((r) => r.coverUrl);
+
+    // orden pensado para que cada tabla solo dependa de tablas que ya se
+    // han terminado de mandar: artistas -> álbumes -> singles (que enlazan
+    // con su álbum) -> giras y merch (enlazan con artista y álbum) ->
+    // notas -> semanas (enlazan con el lanzamiento) -> portadas al final
+    const PHASES = [
       ["artists", data.artists, artistToRow],
-      ["releases", data.releases, releaseToRow],
-      ["snapshots", data.snapshots, snapshotToRow],
+      ["releases", albums, releaseWithoutCover(releaseToRow)],
+      ["releases", singles, releaseWithoutCover(releaseToRow)],
       ["tours", data.tours, tourToRow],
       ["merch", data.merch, merchToRow],
       ["notes", data.notes, noteToRow],
+      ["snapshots", data.snapshots, snapshotToRow],
+      ["releases (portadas)", releasesWithCover, releaseToRow],
     ];
     const runOnePass = async (passLabel) => {
-      const summary = [];
-      for (const [table, rows, toRow] of TABLES) {
+      const summary = {};
+      for (const [table, rows, toRow] of PHASES) {
         const total = (rows || []).length;
-        if (total === 0) { summary.push({ table, total: 0, inserted: 0, errors: [] }); continue; }
+        if (!summary[table]) summary[table] = { table, total: 0, inserted: 0, errors: [] };
+        if (total === 0) continue;
+        summary[table].total += total;
         const chunks = [];
         for (let i = 0; i < rows.length; i += CHUNK_SIZE) chunks.push(rows.slice(i, i + CHUNK_SIZE));
-        let inserted = 0;
-        const errors = [];
         for (let i = 0; i < chunks.length; i++) {
           const payload = chunks[i].map((r) => ({ ...toRow(r), save_id: newSaveId }));
+          const realTable = table.split(" ")[0];
           if (onProgress) onProgress(`${passLabel}: ${table} (${i + 1}/${chunks.length})…`);
           let lastErr = null;
           // hasta 4 intentos por tanda, con pausa creciente — Supabase ha
@@ -3636,20 +3653,19 @@ function SaveMenu({ onSelect }) {
             // upsert (no insert): reintentar una tanda que en realidad ya se
             // había guardado no choca con clave duplicada, y además permite
             // repetir pasadas enteras sin miedo a duplicar nada
-            const { error } = await supabaseWrite.from(table).upsert(payload, { onConflict: "id" });
+            const { error } = await supabaseWrite.from(realTable).upsert(payload, { onConflict: "id" });
             if (!error) { lastErr = null; break; }
             lastErr = error;
           }
           if (lastErr) {
             const code = lastErr.code ? ` (código ${lastErr.code})` : "";
-            errors.push(`tanda ${i + 1} de ${chunks.length}${code}: ${lastErr.message}`);
+            summary[table].errors.push(`tanda ${i + 1} de ${chunks.length}${code}: ${lastErr.message}`);
           } else {
-            inserted += payload.length;
+            summary[table].inserted += payload.length;
           }
         }
-        summary.push({ table, total, inserted, errors });
       }
-      return summary;
+      return Object.values(summary);
     };
 
     // hasta 3 pasadas completas: muchos de los fallos por clave foránea son
@@ -3699,7 +3715,7 @@ function SaveMenu({ onSelect }) {
         const summary = await importInto(id, importFile.data, (label) => setImportProgress(label));
         const withErrors = summary.filter((s) => s.errors.length > 0);
         if (withErrors.length > 0) {
-          const TABLE_LABEL = { artists: "artistas", releases: "lanzamientos", snapshots: "semanas", tours: "giras", merch: "merch", notes: "notas" };
+          const TABLE_LABEL = { artists: "artistas", releases: "lanzamientos", snapshots: "semanas", tours: "giras", merch: "merch", notes: "notas", "releases (portadas)": "portadas" };
           const lines = withErrors.map((s) => `${TABLE_LABEL[s.table] || s.table}: ${s.inserted}/${s.total} importados — ${s.errors[0]}${s.errors.length > 1 ? ` (+${s.errors.length - 1} tanda(s) más)` : ""}`);
           setError(`La partida "${name}" se creó, pero no todo se importó bien:\n${lines.join("\n")}\n\nPuedes reintentar borrándola y volviendo a importar el archivo, o entrar y completar lo que falte a mano.`);
         }
