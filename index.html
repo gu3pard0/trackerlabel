@@ -330,7 +330,7 @@ const TABS = [
 // Súbelo cada vez que se entregue una versión nueva del archivo, así en la
 // barra lateral se puede comprobar de un vistazo si el archivo abierto es
 // la última versión o una copia vieja.
-const APP_VERSION = "v6.4 · 2026-09-04";
+const APP_VERSION = "v6.6 · 2026-09-04";
 
 const SUPABASE_URL = "https://awlgrjrotrzlzquvojkv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_qP20SCcrz30OKe6JMHhcKg_4LhoqcCm";
@@ -3523,6 +3523,7 @@ function SaveMenu({ onSelect }) {
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
   const [importProgress, setImportProgress] = useState("");
+  const [deletingId, setDeletingId] = useState(null);
   const [importFile, setImportFile] = useState(null); // { saveName, exportedAt, data: {...} }
   const [importFileName, setImportFileName] = useState("");
   const fileInputRef = React.useRef(null);
@@ -3540,6 +3541,28 @@ function SaveMenu({ onSelect }) {
     setLoaded(true);
   };
   useEffect(() => { refresh(); }, []);
+
+  // Borra una partida entera: primero todos sus datos en las 6 tablas (por
+  // save_id — no hay borrado en cascada automático, ya que save_id no es
+  // una clave foránea real, solo una etiqueta), y al final la propia fila
+  // de la partida. Las notas globales (save_id null) nunca se tocan.
+  const deleteSave = async (id, name) => {
+    if (!window.confirm(`¿Seguro que quieres borrar "${name}"?\n\nSe perderán TODOS sus datos (artistas, lanzamientos, giras, merch, notas) sin poder deshacerlo. Si quieres conservarlos, expórtala antes de borrarla.`)) return;
+    setDeletingId(id);
+    setError("");
+    try {
+      for (const table of ["snapshots", "tours", "merch", "notes", "releases", "artists"]) {
+        const { error } = await supabaseWrite.from(table).delete().eq("save_id", id);
+        if (error) throw new Error(`${table}: ${error.message}`);
+      }
+      const { error } = await supabaseWrite.from("saves").delete().eq("id", id);
+      if (error) throw new Error(`saves: ${error.message}`);
+      await refresh();
+    } catch (e) {
+      setError("Error borrando la partida: " + e.message);
+    }
+    setDeletingId(null);
+  };
 
   const handleFilePicked = async (file) => {
     if (!file) return;
@@ -3576,29 +3599,42 @@ function SaveMenu({ onSelect }) {
   // incrustadas, una tabla como "releases" puede pesar más de un MB entera,
   // y eso puede fallar por tamaño o por tiempo de espera con un mensaje tan
   // genérico como "Something went wrong" — trocearlo lo evita, y de paso
-  // deja claro en qué tanda concreta ha fallado si pasa.
+  // deja claro en qué tanda concreta ha fallado si pasa. Si una tabla falla,
+  // se sigue intentando con el resto (no se para todo por una sola tabla), y
+  // se devuelve un resumen de qué se importó bien y qué no, en vez de
+  // limitarse a abortar en el primer fallo.
   const importInto = async (newSaveId, data, onProgress) => {
     const CHUNK_SIZE = 8;
+    const summary = [];
     const insertAll = async (table, rows, toRow) => {
-      if (!rows || rows.length === 0) return;
+      const total = (rows || []).length;
+      if (total === 0) { summary.push({ table, total: 0, inserted: 0, errors: [] }); return; }
       const chunks = [];
       for (let i = 0; i < rows.length; i += CHUNK_SIZE) chunks.push(rows.slice(i, i + CHUNK_SIZE));
+      let inserted = 0;
+      const errors = [];
       for (let i = 0; i < chunks.length; i++) {
         const payload = chunks[i].map((r) => ({ ...toRow(r), save_id: newSaveId }));
         if (onProgress) onProgress(`Importando ${table} (${i + 1}/${chunks.length})…`);
         let lastErr = null;
-        // hasta 2 intentos por tanda, por si es un fallo puntual de red
-        for (let attempt = 0; attempt < 2; attempt++) {
+        // hasta 4 intentos por tanda, con pausa creciente — Supabase ha
+        // tenido temporadas inestables, así que se le da margen de sobra
+        // antes de dar esa tanda por perdida
+        const delays = [1500, 3000, 6000];
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, delays[attempt - 1]));
           const { error } = await supabaseWrite.from(table).insert(payload);
           if (!error) { lastErr = null; break; }
           lastErr = error;
-          await new Promise((r) => setTimeout(r, 1200));
         }
         if (lastErr) {
           const code = lastErr.code ? ` (código ${lastErr.code})` : "";
-          throw new Error(`${table}, tanda ${i + 1} de ${chunks.length}${code}: ${lastErr.message}`);
+          errors.push(`tanda ${i + 1} de ${chunks.length}${code}: ${lastErr.message}`);
+        } else {
+          inserted += payload.length;
         }
       }
+      summary.push({ table, total, inserted, errors });
     };
     await insertAll("artists", data.artists, artistToRow);
     await insertAll("releases", data.releases, releaseToRow);
@@ -3606,6 +3642,7 @@ function SaveMenu({ onSelect }) {
     await insertAll("tours", data.tours, tourToRow);
     await insertAll("merch", data.merch, merchToRow);
     await insertAll("notes", data.notes, noteToRow);
+    return summary;
   };
 
   const createSave = async () => {
@@ -3636,11 +3673,17 @@ function SaveMenu({ onSelect }) {
     }
     if (importFile) {
       try {
-        await importInto(id, importFile.data, (label) => setImportProgress(label));
+        const summary = await importInto(id, importFile.data, (label) => setImportProgress(label));
+        const withErrors = summary.filter((s) => s.errors.length > 0);
+        if (withErrors.length > 0) {
+          const TABLE_LABEL = { artists: "artistas", releases: "lanzamientos", snapshots: "semanas", tours: "giras", merch: "merch", notes: "notas" };
+          const lines = withErrors.map((s) => `${TABLE_LABEL[s.table] || s.table}: ${s.inserted}/${s.total} importados — ${s.errors[0]}${s.errors.length > 1 ? ` (+${s.errors.length - 1} tanda(s) más)` : ""}`);
+          setError(`La partida se creó, pero no todo se importó bien:\n${lines.join("\n")}\n\nPuedes reintentar borrando esta partida y volviendo a importar el archivo, o completar lo que falte a mano desde dentro de la partida.`);
+        }
       } catch (e) {
         setCreating(false);
         setImportProgress("");
-        setError("La partida se creó, pero hubo un error importando los datos en: " + e.message + " — puedes seguir y añadir el resto a mano desde dentro de la partida, o borrarla desde Supabase y volver a intentarlo.");
+        setError("La partida se creó, pero hubo un error importando los datos: " + e.message);
         onSelect(id, name);
         return;
       }
@@ -3673,10 +3716,20 @@ function SaveMenu({ onSelect }) {
             <div className="ltk-savemenu-list">
               {saves.length === 0 && <EmptyState text="Todavía no hay ninguna partida creada." />}
               {saves.map((s) => (
-                <button key={s.id} className="ltk-savemenu-item" onClick={() => onSelect(s.id, s.name)}>
-                  <div className="ltk-list-title">{s.name}</div>
-                  <div className="ltk-muted">Creada el {fmtDate(new Date(s.created_at).toISOString().slice(0, 10))}</div>
-                </button>
+                <div key={s.id} className="ltk-savemenu-item" style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 8, cursor: "default" }}>
+                  <button style={{ flex: 1, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0, color: "inherit" }} onClick={() => onSelect(s.id, s.name)}>
+                    <div className="ltk-list-title">{s.name}</div>
+                    <div className="ltk-muted">Creada el {fmtDate(new Date(s.created_at).toISOString().slice(0, 10))}</div>
+                  </button>
+                  {isEditUnlocked() && (
+                    <button
+                      className="ltk-btn-icon is-danger" title="Borrar esta partida" disabled={deletingId === s.id}
+                      onClick={(e) => { e.stopPropagation(); deleteSave(s.id, s.name); }}
+                    >
+                      {deletingId === s.id ? "…" : "✕"}
+                    </button>
+                  )}
+                </div>
               ))}
             </div>
           )}
@@ -3713,7 +3766,7 @@ function SaveMenu({ onSelect }) {
             )}
           </section>
 
-          {error && <div className="ltk-error-banner">{error}</div>}
+          {error && <div className="ltk-error-banner" style={{ whiteSpace: "pre-line" }}>{error}</div>}
         </div>
       </div>
     </div>
