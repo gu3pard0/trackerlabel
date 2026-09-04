@@ -330,7 +330,7 @@ const TABS = [
 // Súbelo cada vez que se entregue una versión nueva del archivo, así en la
 // barra lateral se puede comprobar de un vistazo si el archivo abierto es
 // la última versión o una copia vieja.
-const APP_VERSION = "v6.6 · 2026-09-04";
+const APP_VERSION = "v6.7 · 2026-09-04";
 
 const SUPABASE_URL = "https://awlgrjrotrzlzquvojkv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_qP20SCcrz30OKe6JMHhcKg_4LhoqcCm";
@@ -464,7 +464,7 @@ async function flushSyncQueueOnce() {
       let error;
       if (entry.op === "insert") {
         builtRow = { ...toRow({ id: entry.rowId, createdAt: entry.createdAt, ...entry.formData }), save_id: entry.formData.isGlobal ? null : entry.saveId };
-        ({ error } = await supabaseWrite.from(entry.table).insert([builtRow]));
+        ({ error } = await supabaseWrite.from(entry.table).upsert([builtRow], { onConflict: "id" }));
       } else if (entry.op === "update") {
         builtRow = toRow({ id: entry.rowId, ...entry.formData });
         ({ error } = await supabaseWrite.from(entry.table).update(builtRow).eq("id", entry.rowId));
@@ -3623,7 +3623,7 @@ function SaveMenu({ onSelect }) {
         const delays = [1500, 3000, 6000];
         for (let attempt = 0; attempt < 4; attempt++) {
           if (attempt > 0) await new Promise((r) => setTimeout(r, delays[attempt - 1]));
-          const { error } = await supabaseWrite.from(table).insert(payload);
+          const { error } = await supabaseWrite.from(table).upsert(payload, { onConflict: "id" });
           if (!error) { lastErr = null; break; }
           lastErr = error;
         }
@@ -3659,7 +3659,7 @@ function SaveMenu({ onSelect }) {
       const delays = [1000, 2000, 4000, 8000];
       for (let attempt = 0; attempt < 5; attempt++) {
         if (attempt > 0) { id = uid(); setImportProgress(`reintentando (${attempt + 1}/5)…`); await new Promise((r) => setTimeout(r, delays[attempt - 1] || 8000)); }
-        const { error } = await supabaseWrite.from("saves").insert([{ id, name, created_at: Date.now() }]);
+        const { error } = await supabaseWrite.from("saves").upsert([{ id, name, created_at: Date.now() }], { onConflict: "id" });
         if (!error) { lastErr = null; break; }
         lastErr = error;
       }
