@@ -330,7 +330,7 @@ const TABS = [
 // Súbelo cada vez que se entregue una versión nueva del archivo, así en la
 // barra lateral se puede comprobar de un vistazo si el archivo abierto es
 // la última versión o una copia vieja.
-const APP_VERSION = "v6.3 · 2026-08-29";
+const APP_VERSION = "v6.4 · 2026-09-04";
 
 const SUPABASE_URL = "https://awlgrjrotrzlzquvojkv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_qP20SCcrz30OKe6JMHhcKg_4LhoqcCm";
@@ -1722,10 +1722,24 @@ function EditLockPanel() {
   const [unlocked, setUnlocked] = useState(isEditUnlocked());
   const [input, setInput] = useState("");
   const [showForm, setShowForm] = useState(false);
+  const [keyError, setKeyError] = useState("");
+
+  // Una clave con símbolos raros (£, tildes, comillas curvas...) puede viajar
+  // mal en la cabecera HTTP x-edit-key y hacer que el servidor la rechace de
+  // forma confusa (un 500 en vez de un aviso claro) — así que se exige que
+  // sea solo texto ASCII normal (letras, números y los símbolos básicos del
+  // teclado en inglés).
+  const isAsciiSafe = (s) => /^[\x20-\x7E]*$/.test(s);
 
   const unlock = () => {
-    if (!input.trim()) return;
-    try { localStorage.setItem("ltk_edit_key", input.trim()); } catch (e) { console.error(e); }
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    if (!isAsciiSafe(trimmed)) {
+      setKeyError("Esa clave tiene algún símbolo especial (tipo £, tildes, tipografía \"elegante\"...) que puede viajar mal en la conexión y provocar errores raros. Usa solo letras, números y símbolos básicos de teclado en inglés (- _ . ! ? etc).");
+      return;
+    }
+    setKeyError("");
+    try { localStorage.setItem("ltk_edit_key", trimmed); } catch (e) { console.error(e); }
     setTimeout(() => window.location.reload(), 60);
   };
   const lock = () => {
@@ -1747,9 +1761,12 @@ function EditLockPanel() {
       {!showForm ? (
         <button className="ltk-btn-ghost" onClick={() => setShowForm(true)}>Desbloquear edición</button>
       ) : (
-        <div style={{ display: "flex", gap: 6, width: "100%" }}>
-          <input type="password" value={input} onChange={(e) => setInput(e.target.value)} placeholder="Clave" onKeyDown={(e) => { if (e.key === "Enter") unlock(); }} style={{ flex: 1, minWidth: 0 }} />
-          <button className="ltk-btn" onClick={unlock}>OK</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
+          <div style={{ display: "flex", gap: 6, width: "100%" }}>
+            <input type="password" value={input} onChange={(e) => { setInput(e.target.value); setKeyError(""); }} placeholder="Clave" onKeyDown={(e) => { if (e.key === "Enter") unlock(); }} style={{ flex: 1, minWidth: 0 }} />
+            <button className="ltk-btn" onClick={unlock}>OK</button>
+          </div>
+          {keyError && <div className="ltk-error-banner" style={{ margin: 0, fontSize: 11.5 }}>{keyError}</div>}
         </div>
       )}
     </div>
@@ -3594,15 +3611,17 @@ function SaveMenu({ onSelect }) {
   const createSave = async () => {
     const name = newName.trim() || `Partida ${saves.length + 1}`;
     setCreating(true);
-    const id = uid();
+    let id = uid();
     try {
       let lastErr = null;
       // hasta 5 intentos con pausa creciente — es una acción puntual (no una
       // cola de cientos de elementos), así que se le puede dar bastante más
-      // margen por si Supabase está teniendo un momento inestable
+      // margen por si Supabase está teniendo un momento inestable. Se genera
+      // un id nuevo en cada intento (no se reutiliza el mismo), por si algún
+      // intento anterior sí llegó a guardarse a pesar de devolver error.
       const delays = [1000, 2000, 4000, 8000];
       for (let attempt = 0; attempt < 5; attempt++) {
-        if (attempt > 0) { setImportProgress(`reintentando (${attempt + 1}/5)…`); await new Promise((r) => setTimeout(r, delays[attempt - 1] || 8000)); }
+        if (attempt > 0) { id = uid(); setImportProgress(`reintentando (${attempt + 1}/5)…`); await new Promise((r) => setTimeout(r, delays[attempt - 1] || 8000)); }
         const { error } = await supabaseWrite.from("saves").insert([{ id, name, created_at: Date.now() }]);
         if (!error) { lastErr = null; break; }
         lastErr = error;
